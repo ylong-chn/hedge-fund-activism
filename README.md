@@ -1,7 +1,5 @@
 # hedge-fund-activism
 
-Fast approach to hedge fund activism (HFA) data collection
-
 The data collection process for HFA has been found challenging, due to the following difficaulties: 
 
 - Downloading of SC 13D forms, which is large in volume and varies in file types;
