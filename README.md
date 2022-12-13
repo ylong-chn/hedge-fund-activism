@@ -1,15 +1,14 @@
 # hedge-fund-activism
 
-The data collection process for HFA has been found challenging, due to the following difficaulties: 
+The data collection process for hedge fund activism (HFA) has been found challenging due to the following difficaulties: 
 
 - Downloading of SC 13D forms, which is large in volume and varies in file types;
-- Extraction of relevant information from SC 13D filing, which requires text mining;
+- Extraction of relevant information from a SC 13D form, which requires text mining;
 - Matching subject names from SC 13D forms to ticker symbols to perform stock analysis;
 - Acquiring stock data for all target firms. 
 
 We collect HFA data in the following way: 
-- SC 13D forms are downloaded from SEC, parsed, and stored in local database. 
-We adapted the code from Schwartz-Ziv & Volkova (2021).
+- SC 13D forms are downloaded from SEC, parsed, and stored in local database. Code is adapted from Schwartz-Ziv & Volkova (2021).
 - Then ticker symbols are matched to CIK on 13D filings with `sec-cik-mapper`.
 - Next, identify *hedge fund* filers using information from WhaleWisdom.com.
 - Stock prices are retrieved from Yahoo Finance using R package `quantmod`.
