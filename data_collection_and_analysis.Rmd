@@ -1,0 +1,468 @@
+---
+title: "13D Data Collection and Cleaning"
+output: html_document
+---
+
+```{r setup, include=FALSE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(here)
+library(quantmod)
+source('data-utils.R')
+library(gridExtra)
+```
+
+## Download and process 13D filing data
+
+For this study, we focus on the short term market reactions to the initial SC 13D's filed 
+from Jan 2020 through Sept 2022. 
+
+```{r warning=FALSE}
+# set up data folder
+if(!dir.exists("data")) dir.create("data")
+
+# if data is cached, load cached data 
+sec_header_cache <- here("data", "sec_header_cache.rds")
+
+if(!file.exists(sec_header_cache)) {
+  # specify quarters
+  start_QTR <- "2020Q1"
+  end_QTR <- "2022Q3"
+  
+  # specify output directory
+  out_dir <- paste0(here("data"), "/")
+  if(!dir.exists(paste0(out_dir, "Forms/"))) dir.create(paste0(out_dir, "Forms/"))
+  if(!dir.exists(paste0(out_dir, "Master/"))) dir.create(paste0(out_dir, "Master/"))
+  if(!dir.exists(paste0(out_dir, "Clean Forms/"))) dir.create(paste0(out_dir, "Clean Forms/"))
+  if(!dir.exists(paste0(out_dir, "Parsed Forms/"))) dir.create(paste0(out_dir, "Parsed Forms/"))
+  
+  # get starting date for each quarter
+  dates <- get_dates(start_QTR, end_QTR)
+  
+  sec_header_all <- c()
+  # start the pipeline
+  for (i in 1:length(dates)) {
+    # get master file
+    master <- qtr.master.file(dates[i])
+    
+    # write master file into csv file
+    fwrite(master, paste0(out_dir, "Master/master_", year(dates[i]), quarter(dates[i]), ".csv"), row.names = F)
+    
+    # download 13D forms listed in the master file
+    print(paste0("Dowloading initial 13D forms for quarter number ", quarter(dates[i]), " of year ", year(dates[i]), "..."))
+    dwnld.files(master)
+    
+    # put files into SQL
+    print(paste0("Putting all files into SQL & cleaning for quarter number ", quarter(dates[i]), " of year ", year(dates[i]), "..."))
+    # database for raw forms
+    dbraw <- paste0(out_dir, "Forms/", year(dates[i]), quarter(dates[i]), ".sqlite")
+    put.files.in.sql(dbraw)
+    
+    # extract body and subject/filer block information
+    print(paste0("Extracting block information for quarter number ", quarter(dates[i]), " of year ", year(dates[i]), "..."))
+    master <- master %>% 
+      mutate(address = paste0(gsub("(-)|(.txt)", "", link), "/", file))
+    con1 <- dbConnect(SQLite(), dbname = dbraw)
+    # database for cleaned forms
+    dbblock <- paste0(out_dir, "Clean Forms/sc13_", year(dates[i]), quarter(dates[i]), ".sqlite")
+    put.into.db(dbblock, master, con1)
+    dbDisconnect(con1)
+    
+    # parse SEC information 
+    print(paste0("Parsing SEC headers for quarter number ", quarter(dates[i]), " of year ", year(dates[i]), "..."))
+    con2 <- dbConnect(drv = RSQLite::SQLite(), dbname = dbblock)
+    ## Fetch data into data frame
+    res1 <- dbFetch(dbSendQuery(con2, "SELECT FILENAME, SBJ, FIL, LINK, DATE, TYPE FROM filings"), n = -1)
+    out <- data.frame(
+      FILENAME = res1$FILENAME, TYPE = res1$TYPE,
+      DATE = res1$DATE, LINK = res1$LINK
+    )
+    # getting filer information
+    df <- sec_header(res1$FILENAME, res1$FIL)
+    colnames(df) <- paste0("fil_", colnames(df))
+    # getting subject information
+    df_sbj <- sec_header(res1$FILENAME, res1$SBJ)
+    df_sbj$FILENAME <- NULL
+    df_sbj$FORM_TYPE <- NULL
+    colnames(df_sbj) <- paste0("sbj_", colnames(df_sbj))
+    out <- cbind(out, df, df_sbj)
+    
+    # # extracting CUSIP
+    # print(paste0("Extracting CUSIP for quarter number ", quarter(dates[i]), " of year ", year(dates[i]), "..."))
+    # res2 <- dbFetch(dbSendQuery(con2, "SELECT * FROM filings"), n = -1)
+    # match <- match(sec_header$FILENAME, res2$FILENAME)
+    # CUSIP <- extract_CUSIP(res2$FILING)
+    # CUSIP_df <- CUSIP_table(CUSIP)
+    # sec_header <- sec_header %>% 
+    #   mutate(CUSIP = CUSIP_df$CUSIP[match],
+    #          CUSIP6 = CUSIP_df$CUSIP6[match])
+    dbDisconnect(con2)
+    
+    # put information into aggregate table
+    sec_header_all <- rbind(sec_header_all, out)
+  }
+  
+  # save information to cache file
+  saveRDS(sec_header_all, sec_header_cache)
+} else {
+  sec_header_all <- readRDS(sec_header_cache)
+}
+
+```
+
+For our analysis we only need filer name, subject name, CIK,and CUSIP, as well as filing date. 
+
+```{r}
+sc13D_data <- sec_header_all %>% 
+  select(DATE, fil_CIK, fil_CNAME, sbj_CIK, sbj_CNAME) %>% 
+  rename(fil_date = DATE, fil_cik = fil_CIK, fil_name = fil_CNAME, 
+         sbj_cik = sbj_CIK, sbj_name = sbj_CNAME) %>% 
+  mutate(fil_date = as_date(as.numeric(fil_date)),
+         fil_name = tolower(fil_name),
+         sbj_name = tolower(sbj_name),
+         sbj_cik = as.numeric(sbj_cik))
+```
+
+When we have the CIK information, we can map it to ticker symbol. 
+Here I use pre-generated mappings provided by `sec-cik-mapper` 
+(available at: https://github.com/jadchaar/sec-cik-mapper).
+
+I first filtered out the individual (non-institutional) investors. 
+
+```{r}
+mapping <- read.csv(here("mappings.csv"))
+sc13D_sub <- sc13D_data %>% 
+  select(fil_date, fil_name, sbj_name, sbj_cik) %>% 
+  filter(grepl("llc|l.l.c|lp|l.p|gmbh|partnership|inc|ltd|partners", fil_name)) %>% 
+  inner_join(mapping, by = c("sbj_cik" = "CIK")) %>% 
+  arrange(sbj_name)
+
+write.csv(unique(sc13D_sub$fil_name), "filer_name.csv")
+```
+
+The next step is to select the hedge fund positions. 
+There is no quick way of doing this. Brav et al. (2008) checked the filer names from Schedule 13D's 
+manually to determine if the filer is indeed a hedge fund. 
+
+For this project, a quick and "dirty" way of identifying hedge fund position is adopted. 
+The website WhaleWisdom.com contains information of almost all 13F filers, 
+a form required by SEC for every institutional investment managers, 
+and that the website provides labels for the 13F filers, 
+indicating if this filer is a private equity, venture capital, activist investor, and/or hedge fund. 
+So for each filer name in our 13D database, we check if it is labeled hedge fund on WhaleWisdom.com, 
+and filter out those without hedge fund label. This gives us the final filer-subject data. 
+
+```{r}
+# read the labeled filer names
+filer <- read.csv("filer_name_complete.csv")
+head(filer)
+lab_filer <- filer %>% 
+  filter(is_hedge_fund == "Y")
+
+sc13D_sub <- sc13D_sub %>% 
+  filter(fil_name %in% lab_filer$x,
+         Exchange != "OTC",
+         !grepl("-", Ticker)) %>% 
+  distinct() %>% 
+  mutate(ticker_len = str_length(Ticker)) %>% 
+  group_by(sbj_cik) %>% 
+  filter(ticker_len == min(ticker_len)) %>% 
+  ungroup()
+```
+
+We can check how many subject and filer entities are involved: 
+
+```{r}
+# subjects
+length(unique(sc13D_sub$sbj_name))
+
+# filers
+length(unique(sc13D_sub$fil_name))
+```
+
+218 filers, 405 subjects, 474 interventions. 
+
+## Download stock price data with `quantmod` package
+
+Now we can download the stock price for the associated tickers. 
+For some subjects, there are multiple associated tickers, due to different classes of stocks or 
+shares offered in different markets. Since the stock prices of different classes or markets 
+associated with the same company should be correlated, we only need one for our analysis. 
+A naive way is to choose the shortest ticker, as usually this represents the ticker that is 
+associated with highest volume of trading. 
+
+# ```{r}
+# # write a function that calculates the average volume of the stock given ticker and filing date 
+# avg_vol <- function(ticker, fil_date) {
+#   tryCatch(
+#     expr = {
+#     # first download the stock price for the ticker 
+#     price <- getSymbols(Symbols = ticker, from = fil_date - 20, to = fil_date + 20, auto.assign = FALSE)
+#     # compute the average volume
+#     vol <- price %>% data.frame() %>% select(ends_with("Volume"))
+#     mean(vol[,1])
+#     }, error = function(e) -1)
+# }
+# 
+# volume <- mapply(avg_vol, ticker = sc13D_sub$Ticker, fil_date = sc13D_sub$fil_date)
+# sc13D_sub <- sc13D_sub %>%
+#   rowwise %>% 
+#   mutate(volume = avg_vol(Ticker, fil_date))
+# ```
+
+## Market reaction analysis
+
+Next we analyze the market reaction of the intervention. We choose a (-10 days, 10 days) time window 
+around intervention for our analysis. 
+Days here denote trading days. 
+If we do not have data for the full time window, the position is omitted from analysis. 
+
+```{r warning=FALSE, message=FALSE}
+# analysis of market reaction
+
+int_price <- function(ticker, fil_date) {
+  tryCatch(
+    expr = {
+      # first download the stock price for the ticker
+      price <- getSymbols(Symbols = ticker, from = fil_date - 20, to = fil_date + 50, auto.assign = FALSE) %>% 
+        data.frame() %>% select(ends_with("Adjusted"))
+      
+      price_len <- dim(price)[1]
+      
+      # build a vector storing prices (-10 days, 30 days) around intervention
+      index <- match(as.character(fil_date), rownames(price))
+      
+      if (index - 10 < 1 || price_len < index + 30) return(-1)
+      else {
+        return(price %>% `[[`(1) %>% `[`((index - 10):(index + 30)))
+      }
+      
+    }, error = function(e) - 1)
+}
+
+sc13D_hf <- sc13D_sub %>%
+  rowwise %>%
+  mutate(stock_data = list(int_price(Ticker, fil_date))) %>%
+  filter(length(unlist(stock_data)) > 1)
+
+stock_price <- data.frame(t(do.call(rbind, sc13D_hf$stock_data)))
+names(stock_price) <- sc13D_hf$Ticker
+
+# check NA as getSymbols warned about it
+which(is.na(colSums(stock_price)))
+
+# it seems BDSI has a few NA entries, this is because it is bought out before the time window
+# since only a few days of data are missing, we just impute the last few days with the last available price
+stock_price$BDSI[37:41] <- stock_price$BDSI[36]
+
+# Also data on R has some missing entries, we impute using data on previous day
+for (i in 2:41) {
+  prev <- stock_price$R[i-1]
+  if (is.na(stock_price$R[i])) stock_price$R[i] <- prev
+}
+
+# market reaction of intervention
+# calculation of daily return
+stock_ret <- stock_price
+stock_ret[1,] <- 0
+for (i in 2:dim(stock_ret)[1]) {
+  stock_ret[i,] <- log(stock_price[i,]/stock_price[i-1,]) 
+}
+
+# calculation of cumulative return (buy-and-hold return)
+bah_ret_tg <- cumsum(stock_ret)
+
+# calculation of average buy-and-hold return assuming equally weighted
+avg_bah_ret_stock <- rowMeans(bah_ret_tg)
+
+# next, need S&P 500 data for comparison
+sp_price_all <- getSymbols(Symbols = "^GSPC", from = as.Date("2019-12-01"), auto.assign = FALSE) %>% 
+  data.frame() %>% select(ends_with("Adjusted"))
+
+sp_price <- stock_price
+# for each stock, we have different time window to compare, so we retrieve S&P 500 data for each time window
+for (i in 1:dim(stock_price)[2]) {
+  index <- match(as.character(sc13D_hf$fil_date[i]), rownames(sp_price_all))
+  sp_price[,i] <- sp_price_all %>% `[[`(1) %>% `[`((index - 10):(index + 30))
+}
+
+sp_price$OESX[41] <- sp_price$OESX[40]
+
+sp_ret <- sp_price
+sp_ret[1,] <- 0
+for (i in 2:dim(sp_ret)[1]) {
+  sp_ret[i,] <- log(sp_price[i,]/sp_price[i-1,]) 
+}
+# calculation of cumulative return (buy-and-hold return)
+bah_ret <- cumsum(sp_ret)
+# calculation of average buy-and-hold return assuming equally weighted
+avg_bah_ret_sp <- rowMeans(bah_ret)
+
+```
+
+Create plot visualizing the average cumulative returns of target and index for first time window
+
+```{r}
+# Cumulative announcement return from -10 days to 30 days after intervention
+data.frame(stock = avg_bah_ret_stock, 
+           index = avg_bah_ret_sp,
+           day = c(-10:30)) %>%
+  pivot_longer(cols = c(stock, index), names_to = 'what', values_to = 'return') %>% 
+  ggplot(aes(x = day, y = return, color = what, shape = what)) +
+  geom_point(size = 2.5) +
+  geom_line(size = 1) + 
+  scale_color_manual(breaks = c('stock', 'index'),
+                     values = c('index' = '#D55E00',
+                                'stock' = '#0072B2'),
+                     labels = c("Target", "S&P 500")) +
+  scale_shape_manual(breaks = c('stock', 'index'),
+                     values = c('index' = 15,
+                                'stock' = 16),
+                       labels = c("Target", "S&P 500")) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = 'Days around 13D filing', y = 'Cumulative abnormal return') +
+  guides(color=guide_legend(title=""),
+         shape=guide_legend(title="")) +
+  theme_bw() +
+  theme(panel.background = element_rect(fill = 'transparent', color = NA),
+        plot.background = element_rect(fill = 'transparent', color = NA),
+        legend.position = c(0.9, 0.88),
+        legend.text = element_text(size=11),
+        panel.grid.major = element_line(color = 'gray30', size = rel(0.5), linetype='dotted'),
+        panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = '#ffffff', color = 'gray50', size = 0.3),
+        strip.text = element_text(size = rel(0.75)),
+        panel.border = element_rect(color = 'gray50', size = 0.3),
+        legend.background = element_blank())
+
+# separate plots for the two time windows
+plot1 <- data.frame(stock = avg_bah_ret_stock[1:21], 
+           index = avg_bah_ret_sp[1:21],
+           day = c(-10:10)) %>%
+    pivot_longer(cols = c(stock, index), names_to = 'what', values_to = 'return') %>% 
+    ggplot(aes(x = day, y = return, color = what, shape = what)) +
+    geom_point(size = 2.5) +
+    geom_line(size = 1) + 
+    scale_color_manual(breaks = c('stock', 'index'),
+                       values = c('index' = '#D55E00',
+                                  'stock' = '#0072B2'),
+                       labels = c("Target", "S&P 500")) +
+    scale_shape_manual(breaks = c('stock', 'index'),
+                       values = c('index' = 15,
+                                  'stock' = 16),
+                       labels = c("Target", "S&P 500")) +
+    scale_y_continuous(labels = scales::percent) +
+    labs(x = 'Days around 13D filing', y = 'Cumulative abnormal return') +
+    guides(color=guide_legend(title=""),
+           shape=guide_legend(title="")) +
+    theme_bw() +
+    theme(panel.background = element_rect(fill = 'transparent', color = NA),
+          plot.background = element_rect(fill = 'transparent', color = NA),
+          legend.position = c(0.9, 0.96),
+          legend.text = element_text(size=11),
+          panel.grid.major = element_line(color = 'gray30', size = rel(0.5), linetype='dotted'),
+          panel.grid.minor = element_blank(),
+          strip.background = element_rect(fill = '#ffffff', color = 'gray50', size = 0.3),
+          strip.text = element_text(size = rel(0.75)),
+          panel.border = element_rect(color = 'gray50', size = 0.3),
+          legend.background = element_blank())
+```
+
+T-test for the first time window
+
+```{r}
+# testing abnormal returns on day -9, -6, -3, -1, 0, 1, 3, 6, 9
+# day 0 is the 11th element in each column
+p_val <- sapply(c(2, 5, 8, 10, 11, 12, 14, 17, 20, 21), function(i) {
+  test <- t.test(as.numeric(bah_ret_tg[i,] - sp_ret[i,]), mu = 0)
+  test$p.value
+})
+
+round(p_val, 4)
+
+ex_rt <- sapply(c(2, 5, 8, 10, 11, 12, 14, 17, 20, 21), function(i) {
+  mean(as.numeric(bah_ret_tg[i,] - sp_ret[i,]))
+})
+
+round(ex_rt * 100, 2)
+```
+
+Do the same for the second time window
+
+```{r}
+# analysis for second time window 
+# calculation of daily return
+stock_ret <- stock_price[21:dim(stock_price)[1],]
+stock_ret[1,] <- 0
+for (i in 2:dim(stock_ret)[1]) {
+  stock_ret[i,] <- log(stock_price[i+20,]/stock_price[i+19,]) 
+}
+
+# calculation of cumulative return (buy-and-hold return)
+bah_ret_tg <- cumsum(stock_ret)
+
+# calculation of average buy-and-hold return assuming equally weighted
+avg_bah_ret_stock <- rowMeans(bah_ret_tg)
+
+# next, need S&P 500 data for comparison
+sp_ret <- sp_price[21:dim(sp_price)[1],]
+sp_ret[1,] <- 0
+for (i in 2:dim(sp_ret)[1]) {
+  sp_ret[i,] <- log(sp_price[i+20,]/sp_price[i+19,]) 
+}
+# calculation of cumulative return (buy-and-hold return)
+bah_ret <- cumsum(sp_ret)
+# calculation of average buy-and-hold return assuming equally weighted
+avg_bah_ret_sp <- rowMeans(bah_ret)
+
+p_val <- sapply(c(2, 4, 6, 8, 10, 12, 14, 16, 18, 20), function(i) {
+  test <- t.test(as.numeric(bah_ret_tg[i,] - sp_ret[i,]), mu = 0)
+  test$p.value
+})
+
+round(p_val, 4)
+
+ex_rt <- sapply(c(2, 4, 6, 8, 10, 12, 14, 16, 18, 20), function(i) {
+  mean(as.numeric(bah_ret_tg[i,] - sp_ret[i,]))
+})
+
+round(ex_rt * 100, 2)
+
+# plot for second time window
+plot2 <- data.frame(stock = avg_bah_ret_stock[1:21], 
+           index = avg_bah_ret_sp[1:21],
+           day = c(10:30)) %>%
+    pivot_longer(cols = c(stock, index), names_to = 'what', values_to = 'return') %>% 
+    ggplot(aes(x = day, y = return, color = what, shape = what)) +
+    geom_point(size = 2.5) +
+    geom_line(size = 1) + 
+    scale_color_manual(breaks = c('stock', 'index'),
+                       values = c('index' = '#D55E00',
+                                  'stock' = '#0072B2'),
+                       labels = c("Target", "S&P 500")) +
+    scale_shape_manual(breaks = c('stock', 'index'),
+                       values = c('index' = 15,
+                                  'stock' = 16),
+                       labels = c("Target", "S&P 500")) +
+    scale_y_continuous(labels = scales::percent) +
+    labs(x = 'Days around 13D filing', y = 'Cumulative abnormal return') +
+    guides(color=guide_legend(title=""),
+           shape=guide_legend(title="")) +
+    theme_bw() +
+    theme(panel.background = element_rect(fill = 'transparent', color = NA),
+          plot.background = element_rect(fill = 'transparent', color = NA),
+          legend.position = c(0.9, 0.96),
+          legend.text = element_text(size=11),
+          panel.grid.major = element_line(color = 'gray30', size = rel(0.5), linetype='dotted'),
+          panel.grid.minor = element_blank(),
+          strip.background = element_rect(fill = '#ffffff', color = 'gray50', size = 0.3),
+          strip.text = element_text(size = rel(0.75)),
+          panel.border = element_rect(color = 'gray50', size = 0.3),
+          legend.background = element_blank())
+```
+
+Combining the two plots 
+
+```{r}
+# combine the two plots 
+grid.arrange(plot1, plot2, ncol = 2)
+```
